@@ -34,6 +34,7 @@ from verl.experimental.fully_async_policy.dynamic_schedule import DynamicSchedul
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+from verl.single_controller.ray.base import apply_extra_bundle_resources_config
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
@@ -86,6 +87,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
         self.config = config
+
+        # Per-pool extra placement group bundle resources (must be applied in
+        # this actor process: placement groups are created here).
+        apply_extra_bundle_resources_config(config)
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert not self.hybrid_engine

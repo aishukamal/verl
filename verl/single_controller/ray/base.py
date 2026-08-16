@@ -110,6 +110,59 @@ def get_master_addr_port(master_port_range: Optional[list[int]] = None) -> tuple
     return addr, str(port)
 
 
+# Process-wide mapping of resource-pool name (prefix) -> extra custom resources
+# added to every placement group bundle of matching pools. Populated via
+# set_extra_bundle_resources_by_pool() (e.g. from the ray_pg_extra_resources
+# config section); consulted by RayResourcePool.get_placement_groups() for
+# pools that were not given explicit extra_bundle_resources.
+_extra_bundle_resources_by_pool: dict[str, dict[str, float]] = {}
+
+
+def set_extra_bundle_resources_by_pool(mapping: Optional[dict[str, dict[str, float]]]) -> None:
+    """Configure extra custom resources for placement group bundles, per pool.
+
+    Args:
+        mapping: {pool_name_prefix: {resource_name: amount}}. A pool matches
+            the entry whose key is the longest prefix of the pool's name
+            (e.g. key "rollout_pool" matches pools "rollout_pool_0",
+            "rollout_pool_1", ...). Pass None/{} to clear.
+
+    Custom resources let deployments steer each resource pool onto designated
+    nodes: a bundle {"CPU": 1, "GPU": 1, "trainer_node": 1} is only placeable
+    on a Ray node started with --resources='{"trainer_node": ...}'. The
+    mapping is process-local; call this in every process that creates
+    placement groups (worker processes do not inherit it automatically).
+    """
+    global _extra_bundle_resources_by_pool
+    # Deep-coerce so OmegaConf DictConfig sections work as-is.
+    _extra_bundle_resources_by_pool = {
+        str(pool): {str(resource): float(amount) for resource, amount in dict(resources).items()}
+        for pool, resources in dict(mapping or {}).items()
+    }
+
+
+def resolve_extra_bundle_resources(pool_name: str) -> Optional[dict[str, float]]:
+    """Longest-prefix match of pool_name against the process-wide mapping."""
+    best_key = None
+    for key in _extra_bundle_resources_by_pool:
+        if pool_name.startswith(key) and (best_key is None or len(key) > len(best_key)):
+            best_key = key
+    return _extra_bundle_resources_by_pool[best_key] if best_key is not None else None
+
+
+def apply_extra_bundle_resources_config(config) -> None:
+    """Install the optional ``ray_pg_extra_resources`` config section.
+
+    Call from every process that creates placement groups and has access to
+    the trainer config (the mapping is process-local). No-op when the config
+    has no ``ray_pg_extra_resources`` section.
+    """
+    getter = getattr(config, "get", None) if config is not None else None
+    mapping = getter("ray_pg_extra_resources", None) if getter is not None else None
+    if mapping:
+        set_extra_bundle_resources_by_pool(mapping)
+
+
 class RayResourcePool(ResourcePool):
     def __init__(
         self,
@@ -119,6 +172,7 @@ class RayResourcePool(ResourcePool):
         max_colocate_count: int = 10,
         detached=False,
         accelerator_type: Optional[str] = None,
+        extra_bundle_resources: Optional[dict[str, float]] = None,
     ) -> None:
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
@@ -127,6 +181,10 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         self.accelerator_type = accelerator_type
+        # Extra custom resources added to every bundle of this pool's placement
+        # groups. When None, falls back to the process-wide per-pool mapping
+        # (set_extra_bundle_resources_by_pool) keyed by this pool's name_prefix.
+        self.extra_bundle_resources = extra_bundle_resources
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
@@ -148,6 +206,18 @@ class RayResourcePool(ResourcePool):
             bundle[device_name] = 1
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
+        extra_bundle_resources = (
+            self.extra_bundle_resources
+            if self.extra_bundle_resources is not None
+            else resolve_extra_bundle_resources(self.name_prefix)
+        )
+        if extra_bundle_resources:
+            bundle.update(extra_bundle_resources)
+            logger.info(
+                "Resource pool %s: adding extra resources %s to every placement group bundle",
+                self.name_prefix,
+                extra_bundle_resources,
+            )
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
         lifetime = "detached" if self.detached else None

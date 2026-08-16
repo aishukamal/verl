@@ -34,6 +34,7 @@ from verl.experimental.fully_async_policy.message_queue import MessageQueueClien
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, ResourcePoolManager
+from verl.single_controller.ray.base import apply_extra_bundle_resources_config
 from verl.trainer.ppo.utils import (
     create_rl_dataset,
     create_rl_sampler,
@@ -345,6 +346,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+
+        # Per-pool extra placement group bundle resources (must be applied in
+        # this actor process: standalone rollout placement groups are created here).
+        apply_extra_bundle_resources_config(config)
+
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
 
         assert not self.hybrid_engine

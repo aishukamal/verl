@@ -54,6 +54,15 @@ async_training:
   # Maximum number of concurrent generation requests per replica.
   concurrent_samples_per_replica: 16
 
+# Optional: extra custom resources added to every placement group bundle of a
+# resource pool, keyed by pool name prefix. Lets deployments steer each pool
+# onto designated Ray nodes (nodes advertise the matching custom resource at
+# `ray start --resources='{"trainer_node": 100}'`). Example:
+#   ray_pg_extra_resources:
+#     trainer_pool: {trainer_node: 1}
+#     rollout_pool: {rollout_node: 1}
+ray_pg_extra_resources: null
+
 # Rollout config
 rollout:
 
