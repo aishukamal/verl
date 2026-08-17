@@ -322,6 +322,49 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.partial_rollout="${partial_rollout}"
 ```
 
+### Lifecycle Hooks and Custom Trainers
+
+External systems (cluster resource coordinators, telemetry exporters, custom
+checkpoint policies) can observe or gate the coarse phase transitions of the
+fully async training loop without forking the trainer. `FullyAsyncTrainer`
+exposes empty `on_*` template methods, following the same convention as the
+v1 trainers (`verl.trainer.ppo.v1.trainer_base.PPOTrainer`); subclass the
+trainer and override any subset:
+
+| hook | fired |
+|---|---|
+| `on_init_workers_begin` / `on_init_workers_end` | around worker-group creation + model load |
+| `on_sample_end` | a full training batch was dequeued and assembled (its rollout metrics are in `self.metrics`) |
+| `on_update_weights_begin` / `on_update_weights_end(synced)` | around `_fit_update_weights()`; `synced=True` iff weights were pushed this call |
+| `on_save_checkpoint(force)` | before a checkpoint save; return `False` to skip it |
+| `on_exception(point, exc)` | an exception escaped `init_workers()` or `fit()` (fired once, before the re-raise) |
+
+Except for `on_save_checkpoint`, hooks may be overridden as coroutine
+functions. Register the subclass and select it by name:
+
+```python
+from verl.experimental.fully_async_policy.fully_async_trainer import (
+    FullyAsyncTrainer,
+    register_trainer,
+)
+
+@register_trainer("my_trainer")
+class MyTrainer(FullyAsyncTrainer):
+    def on_sample_end(self):
+        ...
+```
+
+```bash
+python -m verl.experimental.fully_async_policy.fully_async_main \
+    async_training.trainer_name=my_trainer \
+    ...
+```
+
+Registration only requires importing the module that defines the subclass;
+packages can ship it through the `verl.plugins` entry-point group, which
+`import verl` loads automatically. Unknown names fail fast with the list of
+registered trainers.
+
 ## Experiments
 
 ### Asynchronous Training on 7B Model

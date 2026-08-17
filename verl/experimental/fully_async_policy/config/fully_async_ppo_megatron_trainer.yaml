@@ -8,6 +8,12 @@ defaults:
 
 async_training:
 
+  # Name of the trainer class to run, as registered with
+  # verl.experimental.fully_async_policy.fully_async_trainer.register_trainer.
+  # External packages can register a FullyAsyncTrainer subclass (e.g. from a
+  # module loaded via the verl.plugins entry-point group) and select it here.
+  trainer_name: "fully_async"
+
   # Maximum samples staleness threshold
   staleness_threshold: 0.1
 

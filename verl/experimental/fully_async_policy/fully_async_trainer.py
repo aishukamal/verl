@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import inspect
 import logging
 import os
 import time
@@ -50,11 +51,25 @@ class TrainingStopException(Exception):
     pass
 
 
-@ray.remote(num_cpus=10)
+async def _maybe_await(result):
+    """Await ``result`` if a hook was overridden as a coroutine function."""
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
 class FullyAsyncTrainer(SeparateRayPPOTrainer):
     """
     A fully asynchronous PPO trainer that obtains samples from a MessageQueue for training.
     Based on an improved implementation of OneStepOffRayTrainer
+
+    The class is instantiated as a Ray actor by ``fully_async_main`` via
+    ``get_trainer_cls()`` (see the registry at the bottom of this module), so
+    subclasses registered with ``register_trainer()`` can be selected through
+    the ``async_training.trainer_name`` config without forking the trainer.
+    Subclasses may override the empty ``on_*`` lifecycle hooks (mirroring
+    ``verl.trainer.ppo.v1.trainer_base.PPOTrainer``) to observe or gate the
+    coarse phase transitions of the fully async training loop.
     """
 
     def __init__(
@@ -489,11 +504,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         Creates:
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
+
+        Fires the ``on_init_workers_begin`` / ``on_init_workers_end`` lifecycle
+        hooks around the actual initialization (worker-group creation and model
+        load are the first accelerator work this trainer performs).
         """
-        self._init_resource_pools()
-        self._create_worker_classes()
-        self._init_worker_groups()
-        self._init_models()
+        await _maybe_await(self.on_init_workers_begin())
+        try:
+            self._init_resource_pools()
+            self._create_worker_classes()
+            self._init_worker_groups()
+            self._init_models()
+        except BaseException as e:
+            await self._dispatch_on_exception("init_workers", e)
+            raise
+        await _maybe_await(self.on_init_workers_end())
 
     async def fit(self):
         """
@@ -501,37 +526,44 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         The driver process only need to call the compute functions of the worker group through RPC
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
+
+        Any exception escaping the training loop fires the ``on_exception``
+        lifecycle hook (once) before being re-raised.
         """
-        print("[FullyAsyncTrainer] Starting FullyAsyncTrainer...")
-        if self.message_queue_client is None:
-            raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
-        if self.rollouter is None:
-            raise ValueError("rollouter not set. Call set_rollouter() first.")
+        try:
+            print("[FullyAsyncTrainer] Starting FullyAsyncTrainer...")
+            if self.message_queue_client is None:
+                raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
+            if self.rollouter is None:
+                raise ValueError("rollouter not set. Call set_rollouter() first.")
 
-        self.max_steps_duration = 0
+            self.max_steps_duration = 0
 
-        self.global_steps += 1
+            self.global_steps += 1
 
-        self.prev_step_profile = False
-        self.curr_step_profile = False
-        self.next_step_profile = False
+            self.prev_step_profile = False
+            self.curr_step_profile = False
+            self.next_step_profile = False
 
-        # Use queue mode, no need for traditional dataloader iterator
-        # Initialize to get the first batch of data
-        while True:
-            try:
-                await self.fit_step()
-            except TrainingStopException:
-                print("[FullyAsyncTrainer] Training stopped by queue termination signal")
-                break
+            # Use queue mode, no need for traditional dataloader iterator
+            # Initialize to get the first batch of data
+            while True:
+                try:
+                    await self.fit_step()
+                except TrainingStopException:
+                    print("[FullyAsyncTrainer] Training stopped by queue termination signal")
+                    break
 
-        self.progress_bar.close()
-        if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
-            rollout_reset_timing_raw = await self._fit_update_weights()
-            if rollout_reset_timing_raw is not None:
-                self._fit_log_aggregated_training_metrics(rollout_reset_timing_raw)
-            await self._fit_validate()
-        self._fit_save_checkpoint(force=True)
+            self.progress_bar.close()
+            if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
+                rollout_reset_timing_raw = await self._fit_update_weights()
+                if rollout_reset_timing_raw is not None:
+                    self._fit_log_aggregated_training_metrics(rollout_reset_timing_raw)
+                await self._fit_validate()
+            self._fit_save_checkpoint(force=True)
+        except BaseException as e:
+            await self._dispatch_on_exception("fit", e)
+            raise
 
     async def fit_step(self, batch_dict: dict = None):
         """
@@ -648,6 +680,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             if batch is None:
                 raise TrainingStopException("Training terminated: queue returned None")
             self._collect_metrics_from_samples(batch, metrics)
+            # A full training batch was dequeued and assembled, and its
+            # embedded rollout metrics were copied into self.metrics: the
+            # per-step resume point of the training loop.
+            await _maybe_await(self.on_sample_end())
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
         return batch
 
@@ -690,6 +726,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
     async def _fit_update_weights(self) -> dict | None:
         """Sync updated weights to rollout replicas.
 
+        Fires the ``on_update_weights_begin`` lifecycle hook on entry and
+        ``on_update_weights_end(synced=...)`` on return, where ``synced`` is
+        True iff weights were actually pushed this call.
+
         Returns:
             The timing_raw dict returned by the rollouter's reset_staleness() (contains
             dynamic_resource/rollout_resource_utilization, used by
@@ -697,7 +737,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             call, or None if this call was a no-op (not the last local_trigger_step). Callers
             should treat "weights were updated" and "return value is not None" as equivalent.
         """
+        await _maybe_await(self.on_update_weights_begin())
         if self.local_trigger_step != 1:
+            await _maybe_await(self.on_update_weights_end(synced=False))
             return None
 
         steps = self.config.global_profiler.steps
@@ -785,6 +827,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             step=self.current_param_version,
         )
 
+        await _maybe_await(self.on_update_weights_end(synced=True))
         return timing_raw
 
     def _fit_log_aggregated_training_metrics(self, rollout_reset_timing_raw: dict):
@@ -871,6 +914,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         print(f"[FullyAsyncTrainer] _trainer_side_validate === END === (total: {total_time:.2f}s)")
 
     def _fit_save_checkpoint(self, force=False):
+        """Save a checkpoint when due.
+
+        Fires the ``on_save_checkpoint`` lifecycle hook first; if it returns
+        ``False`` the save is skipped entirely.
+        """
+        if self.on_save_checkpoint(force=force) is False:
+            print(
+                f"[FullyAsyncTrainer] Checkpoint save at param version {self.current_param_version} "
+                f"(force={force}) skipped by on_save_checkpoint"
+            )
+            return
         if self.current_param_version == self.last_ckpt_version:
             return
 
@@ -1047,3 +1101,117 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             for key, value in batch.meta_info.items():
                 if key.startswith("fully_async") or key.startswith("timing_s"):
                     metrics[key] = value
+
+    # ------------------------------ lifecycle hooks ------------------------------
+    # Empty template methods, following the on_* hook convention of
+    # verl.trainer.ppo.v1.trainer_base.PPOTrainer. Subclasses registered via
+    # register_trainer() override any subset; the base implementations are
+    # no-ops, so behavior is unchanged when they are not overridden.
+    #
+    # Except for on_save_checkpoint (invoked from synchronous code), every
+    # hook may be overridden as a coroutine function: hooks are fired from
+    # the trainer actor's async methods, which await awaitable results.
+
+    def on_init_workers_begin(self):
+        """Called before resource pools / worker groups are created."""
+        return
+
+    def on_init_workers_end(self):
+        """Called after ``init_workers()`` completed successfully."""
+        return
+
+    def on_sample_end(self):
+        """Called after sampling a batch from the message queue.
+
+        Fired once a full training batch has been dequeued and assembled and
+        its embedded rollout metrics were copied into ``self.metrics`` (the
+        per-step resume point of the training loop; the queue wait itself
+        involves no accelerator work).
+        """
+        return
+
+    def on_update_weights_begin(self):
+        """Called on entry to ``_fit_update_weights()`` (every invocation)."""
+        return
+
+    def on_update_weights_end(self, synced: bool):
+        """Called when ``_fit_update_weights()`` returns.
+
+        Args:
+            synced: True iff weights were actually pushed to the rollout
+                replicas during this call (the call was not a
+                ``trigger_parameter_sync_step`` no-op).
+        """
+        return
+
+    def on_save_checkpoint(self, force: bool) -> bool:
+        """Called before a checkpoint save is attempted.
+
+        Must be a regular (non-async) method. Return ``False`` to skip the
+        save (e.g. a custom checkpoint policy); any other return value lets
+        it proceed. The v1 on_* hooks have no veto precedent, so this hook
+        adopts the simplest possible gate: a boolean defaulting to True.
+
+        Args:
+            force: the ``force`` flag passed to ``_fit_save_checkpoint()``.
+        """
+        return True
+
+    def on_exception(self, point: str, exc: BaseException):
+        """Called when an exception escapes ``init_workers()`` or ``fit()``.
+
+        Fired at most once per escaping exception, before it is re-raised.
+        Exceptions raised by this hook itself are logged and suppressed so
+        they can never mask the original failure.
+
+        Args:
+            point: which lifecycle point failed ("init_workers" or "fit").
+            exc: the exception about to be re-raised.
+        """
+        return
+
+    async def _dispatch_on_exception(self, point: str, exc: BaseException) -> None:
+        """Fire ``on_exception`` once per escaping exception, suppressing hook errors."""
+        if exc is getattr(self, "_last_on_exception_exc", None):
+            return
+        self._last_on_exception_exc = exc
+        try:
+            await _maybe_await(self.on_exception(point, exc))
+        except Exception:
+            logger.exception("on_exception hook raised while handling %r at point %r", exc, point)
+
+
+TRAINER_REGISTRY: dict[str, type[FullyAsyncTrainer]] = {"fully_async": FullyAsyncTrainer}
+"""Trainer classes selectable via the ``async_training.trainer_name`` config.
+
+External packages typically register a subclass from a module loaded through
+the ``verl.plugins`` entry-point group, whose import triggers
+``@register_trainer``.
+"""
+
+
+def register_trainer(name: str):
+    """Class decorator that registers a :class:`FullyAsyncTrainer` subclass under ``name``."""
+
+    def decorator(cls: type[FullyAsyncTrainer]) -> type[FullyAsyncTrainer]:
+        if not (isinstance(cls, type) and issubclass(cls, FullyAsyncTrainer)):
+            raise TypeError(f"register_trainer expected a FullyAsyncTrainer subclass, got {cls!r}")
+        existing = TRAINER_REGISTRY.get(name)
+        if existing is not None and existing is not cls:
+            raise ValueError(
+                f"Trainer name '{name}' is already registered to {existing.__name__}; "
+                f"cannot re-register it to {cls.__name__}."
+            )
+        TRAINER_REGISTRY[name] = cls
+        return cls
+
+    return decorator
+
+
+def get_trainer_cls(name: str) -> type[FullyAsyncTrainer]:
+    """Return the :class:`FullyAsyncTrainer` subclass registered under ``name``."""
+    try:
+        return TRAINER_REGISTRY[name]
+    except KeyError:
+        available = ", ".join(sorted(TRAINER_REGISTRY)) or "<none>"
+        raise ValueError(f"Unknown trainer '{name}'. Available trainers: {available}.") from None

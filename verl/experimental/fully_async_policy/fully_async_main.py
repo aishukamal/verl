@@ -23,7 +23,7 @@ import ray
 from omegaconf import OmegaConf
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
-from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+from verl.experimental.fully_async_policy.fully_async_trainer import get_trainer_cls
 from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
@@ -143,7 +143,14 @@ class FullyAsyncTaskRunner:
             if role != Role.Rollout
         }
 
-        trainer = FullyAsyncTrainer.remote(
+        # The trainer class is looked up by name so that FullyAsyncTrainer
+        # subclasses registered via register_trainer() (e.g. from a
+        # verl.plugins entry-point module) can be selected from the config.
+        trainer_name = config.async_training.get("trainer_name", "fully_async")
+        trainer_cls = get_trainer_cls(trainer_name)
+        print(f"[ASYNC MAIN] Using trainer class {trainer_cls.__name__} (async_training.trainer_name={trainer_name})")
+
+        trainer = ray.remote(num_cpus=10)(trainer_cls).remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=trainer_role_mapping,
