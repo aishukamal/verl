@@ -79,7 +79,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.debug import marked_timer
 from verl.utils.debug.metrics import calculate_debug_metrics
-from verl.utils.import_utils import load_extern_type
+from verl.utils.import_utils import load_class_from_fqn, load_extern_type
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -378,13 +378,7 @@ class PPOTrainer(ABC):
             self.llm_server_manager = LLMServerManager.create_empty(config=self.config)
 
         # 10. initialize checkpoint engine manager
-        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        checkpoint_engine_config.backend = "naive"
-        self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
-            config=checkpoint_engine_config,
-            actor_wg=self.actor_rollout_wg,
-            replicas=self.llm_server_manager.get_replicas(),
-        )
+        self.checkpoint_manager: CheckpointEngineManager = self._build_checkpoint_manager()
         logger.info("checkpoint engine manager initialized")
 
         # sleep all replicas to load checkpoint
@@ -392,6 +386,29 @@ class PPOTrainer(ABC):
         self._load_checkpoint()
 
         logger.info("all initialize finished, ready to fit")
+
+    def _build_checkpoint_manager(self) -> CheckpointEngineManager:
+        """Build the checkpoint engine manager that syncs weights into the hybrid rollout replicas.
+
+        ``actor_rollout_ref.rollout.checkpoint_manager_class`` names a ``CheckpointEngineManager``
+        subclass by fully qualified name, as in the V0 trainer. The stock manager only knows how to
+        reach hybrid replicas through the in-process ``naive`` engine (CUDA IPC with the trainer
+        worker), so the configured backend is forced to ``naive`` for it. A custom class receives the
+        configured backend untouched and decides itself how the bytes move.
+        """
+        rollout_config = self.config.actor_rollout_ref.rollout
+        checkpoint_engine_config = omega_conf_to_dataclass(rollout_config.checkpoint_engine)
+        checkpoint_manager_class_fqn = rollout_config.get("checkpoint_manager_class")
+        if checkpoint_manager_class_fqn:
+            manager_cls = load_class_from_fqn(checkpoint_manager_class_fqn, "CheckpointEngineManager")
+        else:
+            manager_cls = CheckpointEngineManager
+            checkpoint_engine_config.backend = "naive"
+        return manager_cls(
+            config=checkpoint_engine_config,
+            actor_wg=self.actor_rollout_wg,
+            replicas=self.llm_server_manager.get_replicas(),
+        )
 
     def get_llm_client(self) -> LLMServerClient:
         """Get the LLM server client for rollout generation."""
