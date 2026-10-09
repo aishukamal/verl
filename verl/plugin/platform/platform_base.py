@@ -280,6 +280,18 @@ class PlatformBase(abc.ABC):
         """
         return None
 
+    def all_reduce(self, tensor: Any, op: Any, group: Any = None) -> None:
+        """In-place all-reduce of a small control tensor, e.g. a micro-batch count or a within-limit flag.
+
+        Defaults to ``torch.distributed.all_reduce``. A platform whose collective backend lowers only
+        some reduction ops overrides this and expresses the requested ``op`` (MAX/MIN of small
+        integers, AND of flags) through the ops it has; the result must equal what
+        ``torch.distributed.all_reduce(tensor, op=op, group=group)`` would leave in ``tensor``.
+        """
+        import torch.distributed as dist
+
+        dist.all_reduce(tensor, op=op, group=group)
+
     # ------------------------------------------------------------------
     # Low-level runtime API
     # ------------------------------------------------------------------

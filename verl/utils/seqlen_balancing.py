@@ -19,6 +19,7 @@ from itertools import chain
 import torch
 from torch import distributed as dist
 
+from verl.plugin.platform import get_platform
 from verl.protocol import DataProto
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name
@@ -402,7 +403,7 @@ def rearrange_micro_batches(
     sync_micro_batch_count = dist.is_initialized() and same_micro_num_in_dp and dp_group is not None
     if sync_micro_batch_count:
         num_micro_batches = torch.tensor([num_micro_batches], device=get_device_name())
-        dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
+        get_platform().all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
         num_micro_batches = num_micro_batches.cpu().item()
     if num_batches_divided_by is not None:
         num_micro_batches = roundup_divisible(num_micro_batches, num_batches_divided_by)
@@ -428,7 +429,7 @@ def rearrange_micro_batches(
     if sync_micro_batch_count:
         # Fatal constraints must be agreed on before any rank raises; otherwise peers can hang in the next collective.
         constraints = torch.tensor([max_group_token_len, -num_groups], dtype=torch.long, device=get_device_name())
-        dist.all_reduce(constraints, op=dist.ReduceOp.MAX, group=dp_group)
+        get_platform().all_reduce(constraints, op=dist.ReduceOp.MAX, group=dp_group)
         max_group_token_len = int(constraints[0].item())
         min_num_groups = -int(constraints[1].item())
 
@@ -455,7 +456,7 @@ def rearrange_micro_batches(
         )
         if sync_micro_batch_count:
             within_limit_tensor = torch.tensor([int(within_limit)], device=get_device_name())
-            dist.all_reduce(within_limit_tensor, op=dist.ReduceOp.MIN, group=dp_group)
+            get_platform().all_reduce(within_limit_tensor, op=dist.ReduceOp.MIN, group=dp_group)
             within_limit = bool(within_limit_tensor.item())
         if within_limit:
             break
